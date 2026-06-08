@@ -38,14 +38,17 @@ public class TunnelClient {
     private final AtomicBoolean isConnected = new AtomicBoolean(false);
     private final int maxReconnectAttempts = 10;
 
-    private WebSocket webSocket;
-    private String tunnelUrl;
+    private volatile WebSocket webSocket;
+    private volatile String tunnelUrl;
 
     // For periodic health checks
     private ScheduledFuture<?> pingTask;
     private final AtomicLong lastPongTime = new AtomicLong(0);
     private static final long PING_INTERVAL = 30; // seconds
-    private static final long PONG_TIMEOUT = 10;  // seconds
+    private static final long PONG_TIMEOUT = 10;  // seconds (max time to wait for pong)
+    
+    // HTTP request timeout for long-running requests
+    private static final long HTTP_REQUEST_TIMEOUT = 300; // seconds (5 minutes)
 
     public TunnelClient(String serverUrl, int localPort, String tunnelName) {
         this.serverUrl = serverUrl;
@@ -95,10 +98,12 @@ public class TunnelClient {
         lastPongTime.set(System.currentTimeMillis());
         pingTask = scheduler.scheduleAtFixedRate(() -> {
             try {
-                // The timeout must be longer than the ping interval.
-                // We check if the last pong was received longer than one interval + one timeout ago.
-                if (System.currentTimeMillis() - lastPongTime.get() > ((PING_INTERVAL + PONG_TIMEOUT) * 1000)) {
-                    System.err.println("❌ Pong timeout, connection is stale. Reconnecting...");
+                // Check if pong response has timed out
+                long timeSinceLastPong = System.currentTimeMillis() - lastPongTime.get();
+                long timeoutMs = (PING_INTERVAL + PONG_TIMEOUT) * 1000;
+                
+                if (timeSinceLastPong > timeoutMs) {
+                    System.err.println("❌ Pong timeout (" + (timeSinceLastPong/1000) + "s), connection is stale. Reconnecting...");
                     webSocket.abort(); // Force close the connection
                     return;
                 }
@@ -121,6 +126,8 @@ public class TunnelClient {
 
     private void handleRequest(JsonNode requestData) {
         long startTime = System.currentTimeMillis();
+        String requestId = requestData.has("requestId") ? requestData.get("requestId").asText() : null;
+        WebSocket currentSocket = this.webSocket; // capture before async dispatch
 
         try {
             String method = requestData.get("method").asText();
@@ -150,7 +157,7 @@ public class TunnelClient {
             // Build the local request
             HttpRequest.Builder requestBuilder = HttpRequest.newBuilder()
                     .uri(URI.create("http://localhost:" + localPort + url))
-                    .timeout(Duration.ofSeconds(25));
+                    .timeout(Duration.ofSeconds(HTTP_REQUEST_TIMEOUT));
 
             // Add headers
             if (headers != null && headers.isObject()) {
@@ -179,18 +186,17 @@ public class TunnelClient {
 
             HttpRequest request = requestBuilder.build();
 
-            // Send request asynchronously
+            // Send request asynchronously; capture socket so reconnects don't break in-flight responses
             httpClient.sendAsync(request, HttpResponse.BodyHandlers.ofString())
                     .thenAccept(response -> {
                         long duration = System.currentTimeMillis() - startTime;
 
                         try {
-                            // Build response object
                             ObjectNode responseObj = objectMapper.createObjectNode();
                             responseObj.put("type", "response");
+                            if (requestId != null) responseObj.put("requestId", requestId);
                             responseObj.put("statusCode", response.statusCode());
 
-                            // Add headers
                             ObjectNode responseHeaders = objectMapper.createObjectNode();
                             response.headers().map().forEach((key, values) -> {
                                 if (!values.isEmpty()) {
@@ -199,11 +205,9 @@ public class TunnelClient {
                             });
                             responseObj.set("headers", responseHeaders);
 
-                            // Add body
                             String responseBodyStr = response.body();
                             JsonNode responseBodyJson = null;
                             if (responseBodyStr != null && !responseBodyStr.isEmpty()) {
-                                // Try to parse as JSON, fallback to string
                                 try {
                                     responseBodyJson = objectMapper.readTree(responseBodyStr);
                                     responseObj.set("body", responseBodyJson);
@@ -213,7 +217,6 @@ public class TunnelClient {
                                 }
                             }
 
-                            // --- Full Response Logging START ---
                             System.out.println("\n<--------------------- LOCAL RESPONSE <---------------------");
                             System.out.println("Status: " + response.statusCode() + " (" + duration + "ms)");
                             System.out.println("\n[Response Headers]");
@@ -224,35 +227,33 @@ public class TunnelClient {
                                 System.out.println(responseBodyJson.isTextual() ? responseBodyJson.asText() : objectMapper.writeValueAsString(responseBodyJson));
                             }
                             System.out.println("----------------------------------------------------------\n");
-                            // --- Full Response Logging END ---
 
-
-                            // Send response back to server
-                            webSocket.sendText(objectMapper.writerWithDefaultPrettyPrinter().writeValueAsString(responseObj), true);
+                            currentSocket.sendText(objectMapper.writerWithDefaultPrettyPrinter().writeValueAsString(responseObj), true);
 
                         } catch (Exception e) {
                             System.err.println("❌ Error processing response: " + e.getMessage());
-                            sendErrorResponse(502, "Failed to process response");
+                            sendErrorResponse(currentSocket, requestId, 502, "Failed to process response");
                         }
                     })
                     .exceptionally(throwable -> {
                         long duration = System.currentTimeMillis() - startTime;
                         System.err.println("   → ERROR (" + duration + "ms): " + throwable.getMessage());
 
-                        sendErrorResponse(502, "Failed to connect to local server");
+                        sendErrorResponse(currentSocket, requestId, 502, "Failed to connect to local server");
                         return null;
                     });
 
         } catch (Exception e) {
             System.err.println("❌ Error handling request: " + e.getMessage());
-            sendErrorResponse(500, "Internal client error");
+            sendErrorResponse(currentSocket, requestId, 500, "Internal client error");
         }
     }
 
-    private void sendErrorResponse(int statusCode, String message) {
+    private void sendErrorResponse(WebSocket socket, String requestId, int statusCode, String message) {
         try {
             ObjectNode errorResponse = objectMapper.createObjectNode();
             errorResponse.put("type", "response");
+            if (requestId != null) errorResponse.put("requestId", requestId);
             errorResponse.put("statusCode", statusCode);
 
             ObjectNode headers = objectMapper.createObjectNode();
@@ -264,7 +265,7 @@ public class TunnelClient {
             errorBody.put("localPort", localPort);
             errorResponse.set("body", errorBody);
 
-            webSocket.sendText(objectMapper.writeValueAsString(errorResponse), true);
+            socket.sendText(objectMapper.writeValueAsString(errorResponse), true);
         } catch (Exception e) {
             System.err.println("❌ Failed to send error response: ".concat(e.getMessage()));
         }
@@ -314,7 +315,7 @@ public class TunnelClient {
         public CompletionStage<?> onText(WebSocket webSocket, CharSequence data, boolean last) {
             try {
                 JsonNode message = objectMapper.readTree(data.toString());
-                String type = message.get("type").asText();
+                String type = message.has("type") ? message.get("type").asText() : "unknown";
 
                 switch (type) {
                     case "registered":
@@ -332,11 +333,38 @@ public class TunnelClient {
                         handleRequest(message);
                         break;
 
+                    case "error":
+                        String errorMsg = message.has("message") ? message.get("message").asText() : "Unknown error";
+                        String errorCode = message.has("code") ? message.get("code").asText() : "";
+                        System.err.println("❌ Server error" + (!errorCode.isEmpty() ? " (" + errorCode + ")" : "") + ": " + errorMsg);
+                        
+                        // Check if it's a fatal error that requires reconnection
+                        if (message.has("fatal") && message.get("fatal").asBoolean()) {
+                            System.err.println("⚠️  Fatal error received, reconnecting...");
+                            webSocket.abort();
+                        }
+                        break;
+
+                    case "ping":
+                        // Respond to server ping with pong
+                        try {
+                            ObjectNode pongMsg = objectMapper.createObjectNode();
+                            pongMsg.put("type", "pong");
+                            webSocket.sendText(objectMapper.writeValueAsString(pongMsg), true);
+                        } catch (JsonProcessingException e) {
+                            System.err.println("❌ Failed to send pong: " + e.getMessage());
+                        }
+                        break;
+
                     default:
-                        System.out.println("Unknown message type: " + type);
+                        System.out.println("⚠️  Unknown message type: " + type);
+                        if (message.toString().length() < 200) {
+                            System.out.println("   Message: " + message.toString());
+                        }
                 }
             } catch (Exception e) {
                 System.err.println("❌ Error processing message: " + e.getMessage());
+                e.printStackTrace();
             }
 
             webSocket.request(1);
@@ -402,9 +430,10 @@ public class TunnelClient {
         String tunnelName = System.getenv().getOrDefault("TUNNEL_NAME", "dev1");
 
         System.out.println("🚀 Starting Tunnel Proxy Java Client\n");
-        System.out.println("   Server:     " + serverUrl);
-        System.out.println("   Local Port: " + localPort);
-        System.out.println("   Tunnel Name:  " + (tunnelName != null ? tunnelName : "auto-generated"));
+        System.out.println("   Server:           " + serverUrl);
+        System.out.println("   Local Port:       " + localPort);
+        System.out.println("   Tunnel Name:      " + (tunnelName != null ? tunnelName : "auto-generated"));
+        System.out.println("   Request Timeout:  " + HTTP_REQUEST_TIMEOUT + "s (supports long-running requests)");
         System.out.println();
 
         // Validate server URL
